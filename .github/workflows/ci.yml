@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: node --check index.js
+
+      - name: Cold boot + MCP tools/list roundtrip
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | node index.js 2> /tmp/stderr.log > /tmp/stdout.log
+          cat /tmp/stderr.log
+          node -e '
+            const fs = require("fs");
+            const lines = fs.readFileSync("/tmp/stdout.log","utf8").trim().split("\n");
+            let count = 0;
+            for (const l of lines) {
+              try {
+                const m = JSON.parse(l);
+                if (m.id === 2 && m.result && m.result.tools) {
+                  count = m.result.tools.length;
+                }
+              } catch(e){}
+            }
+            if (count !== 21) {
+              console.error("FAIL: expected 21 tools, got " + count);
+              process.exit(1);
+            }
+            console.log("PASS: " + count + " tools returned via MCP tools/list");
+          '

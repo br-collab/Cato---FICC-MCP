@@ -636,12 +636,12 @@ async function handleTool(name, args) {
       const ficc_cost_usd = ficc_clearing + ficc_cost_of_capital;
 
       // ── Atomic on-chain rail ───────────────────────────────────────────
-      //   gas_gwei * 65000 gas units * 0.0000000001 * eth_price_proxy
+      //   gas_gwei * 65000 gas units * 1e-9 (gwei → ETH) * eth_price_proxy
       //   eth_price_proxy = 1800 (conservative static for v0.1.0;
       //                           Phase 2 will use a live feed)
       const eth_price_proxy = 1800;
       const onchain_cost_usd = (gas_gwei !== null && gas_gwei !== undefined)
-        ? gas_gwei * 65000 * 0.0000000001 * eth_price_proxy
+        ? gas_gwei * 65000 * 1e-9 * eth_price_proxy
         : null;
 
       // ── Recommendation ─────────────────────────────────────────────────
