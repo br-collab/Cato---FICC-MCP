@@ -1,0 +1,14 @@
+{
+  "name": "cato-mcp",
+  "version": "0.1.0",
+  "description": "Absolute doctrine for tokenized settlement governance — eFICC data oracle for TradFi/DeFi convergence",
+  "main": "index.js",
+  "bin": { "cato-mcp": "./index.js" },
+  "scripts": { "start": "node index.js" },
+  "keywords": ["mcp", "ficc", "sofr", "treasury", "repo", "tokenization", "atomic-settlement", "defi", "tradfi", "aureon"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.6.0"
+  }
+}
