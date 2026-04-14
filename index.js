@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /**
- * Cato MCP Server — v0.2.1
+ * Cato MCP Server — v0.2.2
  * Absolute doctrine for tokenized settlement governance.
  * Multi-chain settlement router with live CoinGecko price feeds.
+ * v0.2.2 restores the SOFR 1-day delta check (funding-market shock
+ * detector) that was dropped in the v0.2.0 refactor — closes the
+ * September 2019 repo spike gap identified by cato_backtest.py.
  *
  * Named after Marcus Porcius Cato — Roman senator and institutional
  * conscience of the Republic. Cato is the Verana L0 data layer for
@@ -52,6 +55,16 @@ const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 const ETH_PRICE_FALLBACK = 3500;   // USD per ETH — CoinGecko fallback
 const SOL_PRICE_FALLBACK = 150;    // USD per SOL — CoinGecko fallback
 
+// Doctrine thresholds — mirror aureon/mcp/cato_client.py exactly. The
+// parity principle (hard rule) says these must be identical across the
+// MCP server and the Python twin so the gate produces the same decision
+// regardless of caller. v0.2.2 restores the SOFR delta trigger that was
+// in the v0.1.0 spec but silently dropped during the v0.2.0 refactor.
+const CATO_OFR_ESCALATE_THRESHOLD = 1.0;
+const CATO_OFR_HOLD_THRESHOLD = 0.5;
+const CATO_GAS_GWEI_HOLD_THRESHOLD = 50.0;
+const CATO_SOFR_DELTA_HOLD_BPS = 10.0;   // funding-market shock detector
+
 // Speed properties (informational, used by get_multichain_gas and
 // compare_settlement_rails output). Block times are rough medians.
 const CHAIN_SPEED = {
@@ -66,7 +79,7 @@ const FRED_KEY = process.env.FRED_API_KEY || ""; // Free key from fred.stlouisfe
 async function get(url, params = {}) {
   try {
     const res = await axios.get(url, { params, timeout: 10000,
-      headers: { "User-Agent": "Cato-MCP-Server/0.2.1 (open-source; Project Aureon; contact: github)" }
+      headers: { "User-Agent": "Cato-MCP-Server/0.2.2 (open-source; Project Aureon; contact: github)" }
     });
     return res.data;
   } catch (e) {
@@ -874,7 +887,7 @@ async function handleTool(name, args) {
       };
     }
 
-    // ── COMPARE SETTLEMENT RAILS (Cato v0.2.1 — live CoinGecko prices) ─────
+    // ── COMPARE SETTLEMENT RAILS (Cato v0.2.2 — SOFR delta in routing) ─────
     case "compare_settlement_rails": {
       const notional_usd = parseFloat(args.notional_usd);
       if (!Number.isFinite(notional_usd) || notional_usd <= 0) {
@@ -882,17 +895,22 @@ async function handleTool(name, args) {
       }
       const term_days = args.term_days || 1;
 
-      // v0.2.1: fetch live ETH/SOL prices first, then fan out to FRED
-      // series and multichainGas (which uses the prices for SOL fee
-      // USD conversion). CoinGecko is fetched once, reused across all
-      // per-rail cost calculations.
+      // v0.2.2: fetch live ETH/SOL prices, SOFR with 2 observations
+      // (today + prior day for delta), OFR FSI, and multichainGas in
+      // parallel. The SOFR delta is now a routing stress override
+      // alongside OFR stress.
       const prices = await getLivePrices();
       const [sofrSeries, stressSeries, rails] = await Promise.all([
-        fredSeries("SOFR", 1),
+        fredSeries("SOFR", 2),
         fredSeries("STLFSI4", 1),
         multichainGas(prices),
       ]);
-      const sofr = parseFloat(sofrSeries.observations?.[0]?.value || "0");
+      const sofrObsList = sofrSeries.observations || [];
+      const sofr = parseFloat(sofrObsList[0]?.value || "0");
+      const sofrPrev = sofrObsList[1]?.value !== undefined ? parseFloat(sofrObsList[1].value) : null;
+      const sofrDeltaBps = (sofrPrev !== null && !Number.isNaN(sofrPrev) && !Number.isNaN(sofr))
+        ? Math.abs(sofr - sofrPrev) * 100
+        : null;
       const ofr_stress = parseFloat(stressSeries.observations?.[0]?.value || "0");
 
       // ── Per-rail cost calculations (using live prices) ─────────────────
@@ -947,21 +965,23 @@ async function handleTool(name, args) {
         .sort((a, b) => a[1].cost_usd - b[1].cost_usd)
         .map(([name, r]) => ({ rail: name, cost_usd: r.cost_usd, speed: r.speed, status: r.status }));
 
-      // ── Routing logic (Cato v0.2.0 doctrine) ───────────────────────────
+      // ── Routing logic (Cato v0.2.2 doctrine — SOFR delta override added)
       const eth_gas = rails.ethereum.gas_gwei;
       const base_gas = rails.base.gas_gwei;
       const solana_fee_usd = rails.solana.fee_usd_estimate;
 
       let recommended_rail;
-      if (ofr_stress > 0.5) {
-        recommended_rail = "ficc_traditional";            // stress overrides everything
+      if (ofr_stress > CATO_OFR_HOLD_THRESHOLD) {
+        recommended_rail = "ficc_traditional";            // OFR stress override
+      } else if (sofrDeltaBps !== null && sofrDeltaBps > CATO_SOFR_DELTA_HOLD_BPS) {
+        recommended_rail = "ficc_traditional";            // SOFR delta override (v0.2.2)
       } else if (notional_usd > 10_000_000 && eth_gas !== null && eth_gas < 30) {
         recommended_rail = "ethereum_l1";                 // large notional, gas is noise
       } else if (solana_fee_usd !== null && solana_fee_usd < 0.01) {
         recommended_rail = "solana";                      // ultra-low cost for any size
       } else if (base_gas !== null && base_gas < 1) {
         recommended_rail = "base";                        // L2 default when available
-      } else if (eth_gas !== null && eth_gas > 50) {
+      } else if (eth_gas !== null && eth_gas > CATO_GAS_GWEI_HOLD_THRESHOLD) {
         recommended_rail = "ficc_traditional";            // gas too high
       } else {
         recommended_rail = "ethereum_l1";                 // fallback
@@ -970,9 +990,16 @@ async function handleTool(name, args) {
       return {
         source: "FRED (SOFR, STLFSI4) + Blockscout (ETH/Base/Arbitrum) + Solana RPC + CoinGecko",
         timestamp: new Date().toISOString(),
-        inputs: { notional_usd, term_days },
+        inputs: {
+          notional_usd,
+          term_days,
+          sofr_prev_pct: sofrPrev,
+          sofr_delta_bps: sofrDeltaBps !== null ? +sofrDeltaBps.toFixed(2) : null,
+        },
         market_state: {
           sofr_pct: sofr,
+          sofr_prev_pct: sofrPrev,
+          sofr_delta_bps: sofrDeltaBps !== null ? +sofrDeltaBps.toFixed(2) : null,
           ofr_stress,
           ethereum_gas_gwei: eth_gas,
           base_gas_gwei: base_gas,
@@ -992,22 +1019,25 @@ async function handleTool(name, args) {
         rails: railTable,
         ranked,
         recommended_rail,
-        doctrine_note: "On-chain atomic DvP eliminates T+1 counterparty risk window. FICC clearing provides netting benefit at scale. Cato v0.2.1 routes by notional, gas, and systemic stress — stress override is absolute.",
+        doctrine_note: "On-chain atomic DvP eliminates T+1 counterparty risk window. FICC clearing provides netting benefit at scale. Cato v0.2.2 routes by notional, gas, OFR stress, AND SOFR 1-day delta — stress overrides (OFR > 0.5 or |SOFR delta| > 10 bps) are absolute and force ficc_traditional.",
         fed_l1_note: "Federal Reserve tokenized deposits (reserves) not yet available for on-chain settlement. PORTS (Duffie 2025) proposes sovereign instrument bridging this gap. Cato will route to Fed L1 when available. Monitor: GENIUS Act, CBDC working groups.",
       };
     }
 
-    // ── ATOMIC SETTLEMENT GATE (Cato v0.2.1 — live prices) ─────────────────
+    // ── ATOMIC SETTLEMENT GATE (Cato v0.2.2 — SOFR delta restored) ─────────
     case "get_atomic_settlement_gate": {
-      // v0.2.1: fetch live prices first so multichainGas reports SOL
-      // fee_usd with the live CoinGecko value. Call cato_gate for rates
-      // + stress context, settlement context for on-chain posture, and
-      // multichainGas(prices) for rail selection.
+      // v0.2.2: fetch live prices, cato_gate + settlement context,
+      // multichain rails, AND a 2-observation SOFR history so we can
+      // compute the 1-day delta. The SOFR delta check is the v0.1.0-era
+      // funding-market shock detector that was dropped in v0.2.0 and
+      // restored after the cato_backtest.py revealed the Sept 2019
+      // repo spike gap.
       const prices = await getLivePrices();
-      const [gateContext, settlementContext, rails] = await Promise.all([
+      const [gateContext, settlementContext, rails, sofrHistory] = await Promise.all([
         handleTool("cato_gate", {}),
         handleTool("get_tokenized_settlement_context", {}),
         multichainGas(prices),
+        fredSeries("SOFR", 2),
       ]);
 
       const ofr_stress = parseFloat(
@@ -1015,25 +1045,38 @@ async function handleTool(name, args) {
       );
       const gas_gwei = settlementContext?.gas_gwei;
 
+      // SOFR 1-day delta computation — null if either observation missing.
+      const sofrObs = (sofrHistory && sofrHistory.observations) || [];
+      const sofrToday = sofrObs[0]?.value !== undefined ? parseFloat(sofrObs[0].value) : null;
+      const sofrPrev = sofrObs[1]?.value !== undefined ? parseFloat(sofrObs[1].value) : null;
+      const sofrDeltaBps = (sofrToday !== null && sofrPrev !== null && !Number.isNaN(sofrToday) && !Number.isNaN(sofrPrev))
+        ? Math.abs(sofrToday - sofrPrev) * 100
+        : null;
+
       const reasons = [];
       let gate_decision = "PROCEED";
       let recommended_rail = "atomic";
       let recommended_chain = null;
 
       // ESCALATE first — systemic stress overrides everything
-      if (ofr_stress > 1.0) {
+      if (ofr_stress > CATO_OFR_ESCALATE_THRESHOLD) {
         gate_decision = "ESCALATE";
         recommended_rail = "human_authority";
-        reasons.push(`OFR stress index at ${ofr_stress.toFixed(2)} — systemic stress threshold (>1.0) breached`);
+        reasons.push(`OFR stress index at ${ofr_stress.toFixed(2)} — systemic stress threshold (>${CATO_OFR_ESCALATE_THRESHOLD}) breached`);
       } else {
         // HOLD if non-systemic friction
-        if (ofr_stress > 0.5) {
+        if (ofr_stress > CATO_OFR_HOLD_THRESHOLD) {
           gate_decision = "HOLD";
-          reasons.push(`OFR stress index at ${ofr_stress.toFixed(2)} — above-average stress (>0.5)`);
+          reasons.push(`OFR stress index at ${ofr_stress.toFixed(2)} — above-average stress (>${CATO_OFR_HOLD_THRESHOLD})`);
         }
-        if (gas_gwei !== null && gas_gwei !== undefined && gas_gwei > 50) {
+        if (gas_gwei !== null && gas_gwei !== undefined && gas_gwei > CATO_GAS_GWEI_HOLD_THRESHOLD) {
           gate_decision = "HOLD";
-          reasons.push(`ETH gas at ${gas_gwei} gwei — above 50 gwei doctrine threshold`);
+          reasons.push(`ETH gas at ${gas_gwei} gwei — above ${CATO_GAS_GWEI_HOLD_THRESHOLD} gwei doctrine threshold`);
+        }
+        // v0.2.2: SOFR 1-day delta trigger (funding-market shock detector)
+        if (sofrDeltaBps !== null && sofrDeltaBps > CATO_SOFR_DELTA_HOLD_BPS) {
+          gate_decision = "HOLD";
+          reasons.push(`SOFR 1-day move of ${sofrDeltaBps.toFixed(1)} bps exceeds ${CATO_SOFR_DELTA_HOLD_BPS} bps doctrine threshold (funding-market shock indicator)`);
         }
         if (gate_decision === "HOLD") {
           recommended_rail = "traditional";
@@ -1065,11 +1108,20 @@ async function handleTool(name, args) {
         recommended_rail,
         recommended_chain,
         timestamp: new Date().toISOString(),
-        doctrine: "Verana L0 — Cato settlement gate v0.2.1",
+        doctrine: "Verana L0 — Cato settlement gate v0.2.2",
         inputs: {
           ofr_stress,
           gas_gwei,
+          sofr_today_pct: sofrToday,
+          sofr_prev_pct: sofrPrev,
+          sofr_delta_bps: sofrDeltaBps !== null ? +sofrDeltaBps.toFixed(2) : null,
           settlement_posture: settlementContext?.settlement_posture ?? null,
+        },
+        thresholds: {
+          escalate_ofr: CATO_OFR_ESCALATE_THRESHOLD,
+          hold_ofr: CATO_OFR_HOLD_THRESHOLD,
+          hold_gas_gwei: CATO_GAS_GWEI_HOLD_THRESHOLD,
+          hold_sofr_delta_bps: CATO_SOFR_DELTA_HOLD_BPS,
         },
         chain_state: rails,
         price_sources: {
@@ -1091,7 +1143,7 @@ async function handleTool(name, args) {
 
 // ── SERVER SETUP ─────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: "cato", version: "0.2.1" },
+  { name: "cato", version: "0.2.2" },
   { capabilities: { tools: {} } }
 );
 
@@ -1118,7 +1170,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Cato MCP Server v0.2.1 running — 23 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC, CoinGecko. Multi-chain settlement router with live prices. Absolute doctrine for tokenized settlement governance.\n");
+  process.stderr.write("Cato MCP Server v0.2.2 running — 23 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC, CoinGecko. Multi-chain settlement router with live prices + SOFR delta funding-shock detector. Absolute doctrine for tokenized settlement governance.\n");
 }
 
 main().catch(err => {
