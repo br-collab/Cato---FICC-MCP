@@ -16,7 +16,7 @@ It feeds the **Verana L0 doctrine gate** in the Aureon governance architecture �
 
 ---
 
-## 22 Tools
+## 23 Tools
 
 ### NY Fed
 
@@ -53,12 +53,13 @@ It feeds the **Verana L0 doctrine gate** in the Aureon governance architecture �
 - `get_recent_13f_filers` — Recent institutional holdings filings
 - `get_company_filings` — Company-specific SEC filings by CIK
 
-### Tokenized Settlement (Multi-Chain Router — v0.2.0)
+### Tokenized Settlement (Multi-Chain Router — v0.2.1)
 
-- `get_multichain_gas` — Live gas/fee state across Ethereum, Base, Arbitrum, Solana, plus the `fed_l1` placeholder
+- `get_onchain_prices` — Live ETH and SOL USD prices via CoinGecko public API (no auth). Standalone tool, also used internally by the rail cost tools.
+- `get_multichain_gas` — Live gas/fee state across Ethereum, Base, Arbitrum, Solana, plus the `fed_l1` placeholder. Includes live USD prices via `price_sources`.
 - `get_tokenized_settlement_context` — ETH gas + SOFR + OFR stress → settlement posture
-- `compare_settlement_rails` — Ranked cost comparison across all 5 rails + recommended rail
-- `get_atomic_settlement_gate` — Verana L0 doctrine gate: `PROCEED` / `HOLD` / `ESCALATE` with `recommended_chain`
+- `compare_settlement_rails` — Ranked cost comparison across all 5 rails + recommended rail. Uses live ETH/SOL prices from CoinGecko.
+- `get_atomic_settlement_gate` — Verana L0 doctrine gate: `PROCEED` / `HOLD` / `ESCALATE` with `recommended_chain`. Uses live prices for rail cost math.
 
 ### Governance
 

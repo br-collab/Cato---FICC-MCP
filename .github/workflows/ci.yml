@@ -44,8 +44,8 @@ jobs:
                 }
               } catch(e){}
             }
-            if (count !== 22) {
-              console.error("FAIL: expected 22 tools, got " + count);
+            if (count !== 23) {
+              console.error("FAIL: expected 23 tools, got " + count);
               process.exit(1);
             }
             console.log("PASS: " + count + " tools returned via MCP tools/list");

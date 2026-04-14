@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Cato MCP Server — v0.2.0
+ * Cato MCP Server — v0.2.1
  * Absolute doctrine for tokenized settlement governance.
- * Multi-chain settlement router.
+ * Multi-chain settlement router with live CoinGecko price feeds.
  *
  * Named after Marcus Porcius Cato — Roman senator and institutional
  * conscience of the Republic. Cato is the Verana L0 data layer for
@@ -16,6 +16,7 @@
  *   - SEC EDGAR:     13F filings, institutional positioning
  *   - Blockscout:    On-chain network state (ETH, Base, Arbitrum)
  *   - Solana RPC:    Priority fees, settlement speed
+ *   - CoinGecko:     Live ETH and SOL USD prices (v0.2.1)
  *
  * Reference: Duffie (2025) "The Case for PORTS" — Brookings Institution.
  */
@@ -42,10 +43,14 @@ const BLOCKSCOUT_CHAINS = {
 };
 const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 
-// Static price proxies for rail cost modelling. v0.2.0 doctrine.
-// Phase 3 will replace these with live feeds from the chains themselves.
-const ETH_PRICE_PROXY = 3500;   // USD per ETH
-const SOL_PRICE_PROXY = 150;    // USD per SOL
+// Price fallback values — used only when the CoinGecko public API is
+// unreachable. v0.2.1 replaces the v0.2.0 static proxies with live
+// CoinGecko prices via getLivePrices() below. The fallback constants
+// are retained so Cato still produces a meaningful cost estimate when
+// CoinGecko is rate-limited or offline, and so the fallback path is
+// observable in the output (price_sources.fallback_used = true).
+const ETH_PRICE_FALLBACK = 3500;   // USD per ETH — CoinGecko fallback
+const SOL_PRICE_FALLBACK = 150;    // USD per SOL — CoinGecko fallback
 
 // Speed properties (informational, used by get_multichain_gas and
 // compare_settlement_rails output). Block times are rough medians.
@@ -61,11 +66,48 @@ const FRED_KEY = process.env.FRED_API_KEY || ""; // Free key from fred.stlouisfe
 async function get(url, params = {}) {
   try {
     const res = await axios.get(url, { params, timeout: 10000,
-      headers: { "User-Agent": "Cato-MCP-Server/0.2.0 (open-source; Project Aureon; contact: github)" }
+      headers: { "User-Agent": "Cato-MCP-Server/0.2.1 (open-source; Project Aureon; contact: github)" }
     });
     return res.data;
   } catch (e) {
     return { error: e.message, url };
+  }
+}
+
+// ── CoinGecko live prices (v0.2.1) ───────────────────────────────────────────
+// Fetches live ETH and SOL USD prices from the free CoinGecko public API.
+// No auth required. Returns {eth, sol, source, timestamp, fallback_used}.
+// If CoinGecko is unreachable or rate-limited, returns the static fallback
+// constants with fallback_used=true so the caller can surface the degraded
+// state. Doctrine note: for institutional deployment, replace with a
+// licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).
+async function getLivePrices() {
+  try {
+    const res = await get(
+      "https://api.coingecko.com/api/v3/simple/price",
+      { ids: "ethereum,solana", vs_currencies: "usd" }
+    );
+    const ethUsd = res?.ethereum?.usd;
+    const solUsd = res?.solana?.usd;
+    const fallbackUsed = !ethUsd || !solUsd;
+    return {
+      eth: ethUsd || ETH_PRICE_FALLBACK,
+      sol: solUsd || SOL_PRICE_FALLBACK,
+      source: fallbackUsed ? "coingecko_partial_fallback" : "coingecko_public",
+      timestamp: new Date().toISOString(),
+      fallback_used: fallbackUsed,
+      note: "Live prices via CoinGecko public API. For institutional deployment use a licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).",
+    };
+  } catch (e) {
+    return {
+      eth: ETH_PRICE_FALLBACK,
+      sol: SOL_PRICE_FALLBACK,
+      source: "static_fallback",
+      timestamp: new Date().toISOString(),
+      fallback_used: true,
+      error: e.message,
+      note: "CoinGecko unreachable. Using Cato static fallback prices.",
+    };
   }
 }
 
@@ -117,14 +159,16 @@ async function blockscoutStats() {
 // ── Solana helper ────────────────────────────────────────────────────────────
 // Uses getRecentPrioritizationFees JSON-RPC to estimate the median priority
 // fee. Solana base fee is a fixed 5000 lamports per signature. Total fee
-// ≈ base (5000) + median prioritization (variable). Returns nulls on failure.
-async function solanaStats() {
+// ≈ base (5000) + median prioritization (variable). Takes a solPrice USD
+// so it can compute a live fee_usd on top of the raw lamports.
+async function solanaStats(solPrice) {
+  const priceUsd = solPrice || SOL_PRICE_FALLBACK;
   try {
     const res = await axios.post(
       SOLANA_RPC,
       { jsonrpc: "2.0", id: 1, method: "getRecentPrioritizationFees", params: [] },
       { timeout: 5000, headers: { "Content-Type": "application/json",
-          "User-Agent": "Cato-MCP-Server/0.2.0 (open-source; Project Aureon)" } }
+          "User-Agent": "Cato-MCP-Server/0.2.1 (open-source; Project Aureon)" } }
     );
     const fees = res.data?.result || [];
     const priorityMedian = fees.length > 0
@@ -137,7 +181,7 @@ async function solanaStats() {
       priority_fee_lamports: priorityMedian,
       total_fee_lamports: totalLamports,
       total_fee_sol: totalLamports * 1e-9,
-      total_fee_usd: totalLamports * 1e-9 * SOL_PRICE_PROXY,
+      total_fee_usd: totalLamports * 1e-9 * priceUsd,
     };
   } catch (e) {
     // Fail safe — assume base fee only so Solana still shows a cost estimate.
@@ -146,7 +190,7 @@ async function solanaStats() {
       priority_fee_lamports: 0,
       total_fee_lamports: 5000,
       total_fee_sol: 5000 * 1e-9,
-      total_fee_usd: 5000 * 1e-9 * SOL_PRICE_PROXY,
+      total_fee_usd: 5000 * 1e-9 * priceUsd,
       error: e.message,
     };
   }
@@ -154,14 +198,17 @@ async function solanaStats() {
 
 // ── Multi-chain orchestrator ─────────────────────────────────────────────────
 // Fetches gas/fee state across every supported rail in parallel. Each fetch
-// is isolated so one slow/broken chain can never block the others. Returns
-// a uniform shape per chain plus the documented fed_l1 placeholder.
-async function multichainGas() {
+// is isolated so one slow/broken chain can never block the others. Takes a
+// prices object ({eth, sol}) so Solana's fee_usd_estimate uses the live
+// CoinGecko value. Returns a uniform shape per chain plus the documented
+// fed_l1 placeholder.
+async function multichainGas(prices) {
+  const resolvedPrices = prices || { eth: ETH_PRICE_FALLBACK, sol: SOL_PRICE_FALLBACK };
   const [eth, base, arb, sol] = await Promise.all([
     blockscoutStatsFor("ethereum"),
     blockscoutStatsFor("base"),
     blockscoutStatsFor("arbitrum"),
-    solanaStats(),
+    solanaStats(resolvedPrices.sol),
   ]);
 
   const chainBlock = (key, stats) => {
@@ -192,7 +239,7 @@ async function multichainGas() {
       priority_fee_lamports: sol.priority_fee_lamports,
       settlement_speed: CHAIN_SPEED.solana,
       status: sol.error ? "placeholder" : "live",
-      note: "Solana 400ms finality. Base fee 5000 lamports + median prioritization. SOL price proxy $150 for USD estimate.",
+      note: `Solana 400ms finality. Base fee 5000 lamports + median prioritization. Live SOL price: $${resolvedPrices.sol.toFixed(2)}.`,
     },
     fed_l1: {
       status: "not_yet_issued",
@@ -204,6 +251,7 @@ async function multichainGas() {
 // ── Rail cost helpers ────────────────────────────────────────────────────────
 // Compute the all-in USD cost of a settlement on each rail. Returns null
 // for rails without live data so the caller can exclude them from ranking.
+// evmL1Cost and solanaCost take their respective live prices as params.
 function ficcCost(notionalUsd, sofrPct, termDays) {
   // 0.5 bps clearing fee net of 40% netting benefit, annualized to term,
   // plus cost of capital at SOFR for the term.
@@ -211,14 +259,16 @@ function ficcCost(notionalUsd, sofrPct, termDays) {
   const coc = notionalUsd * (sofrPct / 100) * (termDays / 360);
   return clearing + coc;
 }
-function evmL1Cost(gasGwei) {
+function evmL1Cost(gasGwei, ethPriceUsd) {
   if (gasGwei === null || gasGwei === undefined) return null;
-  // 65000 gas units * gwei * 1e-9 (gwei→ETH) * ETH_PRICE_PROXY
-  return gasGwei * 65000 * 1e-9 * ETH_PRICE_PROXY;
+  const price = ethPriceUsd || ETH_PRICE_FALLBACK;
+  // 65000 gas units * gwei * 1e-9 (gwei→ETH) * live ETH price
+  return gasGwei * 65000 * 1e-9 * price;
 }
-function solanaCost(feeLamports) {
+function solanaCost(feeLamports, solPriceUsd) {
   if (feeLamports === null || feeLamports === undefined) return null;
-  return feeLamports * 1e-9 * SOL_PRICE_PROXY;
+  const price = solPriceUsd || SOL_PRICE_FALLBACK;
+  return feeLamports * 1e-9 * price;
 }
 
 // ── TOOL DEFINITIONS ─────────────────────────────────────────────────────────
@@ -366,6 +416,11 @@ const TOOLS = [
   },
 
   // ── TOKENIZED SETTLEMENT TOOLS (Cato doctrine layer) ──────────────────────
+  {
+    name: "get_onchain_prices",
+    description: "Live ETH and SOL USD prices from the free CoinGecko public API (no auth). Returns {eth, sol, source, timestamp, fallback_used}. Used internally by compare_settlement_rails and get_atomic_settlement_gate for accurate rail cost math; exposed as a standalone tool so LLM callers can query current spot prices without triggering the full rail comparison. Institutional deployments should swap this for a licensed feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).",
+    inputSchema: { type: "object", properties: {} }
+  },
   {
     name: "get_multichain_gas",
     description: "Fetch current gas/fee conditions across every supported settlement rail simultaneously: Ethereum mainnet, Base L2, Arbitrum L2, and Solana. Each chain is fetched in parallel and isolated so one slow upstream can never block the others. Includes a documented `fed_l1` placeholder for tokenized Fed reserves (pending GENIUS Act / Duffie 2025 PORTS proposal). Output shape: { ethereum, base, arbitrum, solana, fed_l1 }.",
@@ -688,8 +743,10 @@ async function handleTool(name, args) {
 
     // ── CATO GATE (was get_ficc_context) ────────────────────────────────────
     case "cato_gate": {
-      // v0.2.0: also fetch multichain rail state so the DSOR context
-      // includes a chain recommendation alongside rates + stress.
+      // v0.2.1: fetch live prices, FRED/NY Fed rates+stress, and multichain
+      // rail state in parallel so the DSOR context includes a chain
+      // recommendation alongside rates + stress.
+      const prices = await getLivePrices();
       const [sofr, t10y, t2y, t3m, stress, rrp, rails] = await Promise.all([
         fredSeries("SOFR", 1),
         fredSeries("DGS10", 1),
@@ -697,7 +754,7 @@ async function handleTool(name, args) {
         fredSeries("DGS3MO", 1),
         fredSeries("STLFSI4", 1),
         fredSeries("RRPONTSYD", 1),
-        multichainGas(),
+        multichainGas(prices),
       ]);
       const t10 = parseFloat(t10y.observations?.[0]?.value || 0);
       const t2  = parseFloat(t2y.observations?.[0]?.value || 0);
@@ -741,15 +798,44 @@ async function handleTool(name, args) {
         },
         chain_state: rails,
         recommended_chain,
+        price_sources: {
+          eth_usd: prices.eth,
+          sol_usd: prices.sol,
+          source: prices.source,
+          timestamp: prices.timestamp,
+          fallback_used: prices.fallback_used,
+        },
       };
     }
 
-    // ── MULTI-CHAIN GAS (Cato v0.2.0) ──────────────────────────────────────
-    case "get_multichain_gas": {
-      const rails = await multichainGas();
+    // ── ONCHAIN PRICES (Cato v0.2.1) ───────────────────────────────────────
+    case "get_onchain_prices": {
+      const prices = await getLivePrices();
       return {
-        source: "Blockscout (ETH/Base/Arbitrum) + Solana RPC",
+        source: "CoinGecko public API",
+        eth_usd: prices.eth,
+        sol_usd: prices.sol,
+        fetch_source: prices.source,
+        timestamp: prices.timestamp,
+        fallback_used: prices.fallback_used,
+        note: prices.note,
+      };
+    }
+
+    // ── MULTI-CHAIN GAS (Cato v0.2.0, live prices in v0.2.1) ───────────────
+    case "get_multichain_gas": {
+      const prices = await getLivePrices();
+      const rails = await multichainGas(prices);
+      return {
+        source: "Blockscout (ETH/Base/Arbitrum) + Solana RPC + CoinGecko",
         timestamp: new Date().toISOString(),
+        price_sources: {
+          eth_usd: prices.eth,
+          sol_usd: prices.sol,
+          source: prices.source,
+          timestamp: prices.timestamp,
+          fallback_used: prices.fallback_used,
+        },
         ...rails,
       };
     }
@@ -788,7 +874,7 @@ async function handleTool(name, args) {
       };
     }
 
-    // ── COMPARE SETTLEMENT RAILS (Cato v0.2.0 multi-chain) ─────────────────
+    // ── COMPARE SETTLEMENT RAILS (Cato v0.2.1 — live CoinGecko prices) ─────
     case "compare_settlement_rails": {
       const notional_usd = parseFloat(args.notional_usd);
       if (!Number.isFinite(notional_usd) || notional_usd <= 0) {
@@ -796,21 +882,25 @@ async function handleTool(name, args) {
       }
       const term_days = args.term_days || 1;
 
-      // Live market state — SOFR, OFR stress, and all chains in parallel.
+      // v0.2.1: fetch live ETH/SOL prices first, then fan out to FRED
+      // series and multichainGas (which uses the prices for SOL fee
+      // USD conversion). CoinGecko is fetched once, reused across all
+      // per-rail cost calculations.
+      const prices = await getLivePrices();
       const [sofrSeries, stressSeries, rails] = await Promise.all([
         fredSeries("SOFR", 1),
         fredSeries("STLFSI4", 1),
-        multichainGas(),
+        multichainGas(prices),
       ]);
       const sofr = parseFloat(sofrSeries.observations?.[0]?.value || "0");
       const ofr_stress = parseFloat(stressSeries.observations?.[0]?.value || "0");
 
-      // ── Per-rail cost calculations ─────────────────────────────────────
+      // ── Per-rail cost calculations (using live prices) ─────────────────
       const ficc_cost = ficcCost(notional_usd, sofr, term_days);
-      const eth_cost = evmL1Cost(rails.ethereum.gas_gwei);
-      const base_cost = evmL1Cost(rails.base.gas_gwei);
-      const arb_cost = evmL1Cost(rails.arbitrum.gas_gwei);
-      const sol_cost = solanaCost(rails.solana.fee_lamports);
+      const eth_cost = evmL1Cost(rails.ethereum.gas_gwei, prices.eth);
+      const base_cost = evmL1Cost(rails.base.gas_gwei, prices.eth);
+      const arb_cost = evmL1Cost(rails.arbitrum.gas_gwei, prices.eth);
+      const sol_cost = solanaCost(rails.solana.fee_lamports, prices.sol);
 
       const railTable = {
         ficc_traditional: {
@@ -823,25 +913,25 @@ async function handleTool(name, args) {
           cost_usd: eth_cost !== null ? +eth_cost.toFixed(4) : null,
           speed: rails.ethereum.settlement_speed,
           status: rails.ethereum.status,
-          inputs: { gas_gwei: rails.ethereum.gas_gwei, gas_units: 65000, eth_price_proxy: ETH_PRICE_PROXY },
+          inputs: { gas_gwei: rails.ethereum.gas_gwei, gas_units: 65000, eth_price_usd: prices.eth },
         },
         base: {
           cost_usd: base_cost !== null ? +base_cost.toFixed(4) : null,
           speed: rails.base.settlement_speed,
           status: rails.base.status,
-          inputs: { gas_gwei: rails.base.gas_gwei, gas_units: 65000, eth_price_proxy: ETH_PRICE_PROXY },
+          inputs: { gas_gwei: rails.base.gas_gwei, gas_units: 65000, eth_price_usd: prices.eth },
         },
         arbitrum: {
           cost_usd: arb_cost !== null ? +arb_cost.toFixed(4) : null,
           speed: rails.arbitrum.settlement_speed,
           status: rails.arbitrum.status,
-          inputs: { gas_gwei: rails.arbitrum.gas_gwei, gas_units: 65000, eth_price_proxy: ETH_PRICE_PROXY },
+          inputs: { gas_gwei: rails.arbitrum.gas_gwei, gas_units: 65000, eth_price_usd: prices.eth },
         },
         solana: {
           cost_usd: sol_cost !== null ? +sol_cost.toFixed(6) : null,
           speed: rails.solana.settlement_speed,
           status: rails.solana.status,
-          inputs: { fee_lamports: rails.solana.fee_lamports, sol_price_proxy: SOL_PRICE_PROXY },
+          inputs: { fee_lamports: rails.solana.fee_lamports, sol_price_usd: prices.sol },
         },
         fed_l1: {
           cost_usd: null,
@@ -878,7 +968,7 @@ async function handleTool(name, args) {
       }
 
       return {
-        source: "FRED (SOFR, STLFSI4) + Blockscout (ETH/Base/Arbitrum) + Solana RPC",
+        source: "FRED (SOFR, STLFSI4) + Blockscout (ETH/Base/Arbitrum) + Solana RPC + CoinGecko",
         timestamp: new Date().toISOString(),
         inputs: { notional_usd, term_days },
         market_state: {
@@ -888,25 +978,36 @@ async function handleTool(name, args) {
           base_gas_gwei: base_gas,
           arbitrum_gas_gwei: rails.arbitrum.gas_gwei,
           solana_fee_usd_estimate: solana_fee_usd,
-          eth_price_proxy: ETH_PRICE_PROXY,
-          sol_price_proxy: SOL_PRICE_PROXY,
+          eth_price_usd: prices.eth,
+          sol_price_usd: prices.sol,
+        },
+        price_sources: {
+          eth_usd: prices.eth,
+          sol_usd: prices.sol,
+          source: prices.source,
+          timestamp: prices.timestamp,
+          fallback_used: prices.fallback_used,
+          note: "Live prices via CoinGecko public API. For institutional deployment use a licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).",
         },
         rails: railTable,
         ranked,
         recommended_rail,
-        doctrine_note: "On-chain atomic DvP eliminates T+1 counterparty risk window. FICC clearing provides netting benefit at scale. Cato v0.2.0 routes by notional, gas, and systemic stress — stress override is absolute.",
+        doctrine_note: "On-chain atomic DvP eliminates T+1 counterparty risk window. FICC clearing provides netting benefit at scale. Cato v0.2.1 routes by notional, gas, and systemic stress — stress override is absolute.",
         fed_l1_note: "Federal Reserve tokenized deposits (reserves) not yet available for on-chain settlement. PORTS (Duffie 2025) proposes sovereign instrument bridging this gap. Cato will route to Fed L1 when available. Monitor: GENIUS Act, CBDC working groups.",
       };
     }
 
-    // ── ATOMIC SETTLEMENT GATE (Cato v0.2.0 multi-chain) ───────────────────
+    // ── ATOMIC SETTLEMENT GATE (Cato v0.2.1 — live prices) ─────────────────
     case "get_atomic_settlement_gate": {
-      // Call cato_gate for rates + stress context, settlement context for
-      // on-chain posture, and multichainGas for rail selection.
+      // v0.2.1: fetch live prices first so multichainGas reports SOL
+      // fee_usd with the live CoinGecko value. Call cato_gate for rates
+      // + stress context, settlement context for on-chain posture, and
+      // multichainGas(prices) for rail selection.
+      const prices = await getLivePrices();
       const [gateContext, settlementContext, rails] = await Promise.all([
         handleTool("cato_gate", {}),
         handleTool("get_tokenized_settlement_context", {}),
-        multichainGas(),
+        multichainGas(prices),
       ]);
 
       const ofr_stress = parseFloat(
@@ -964,13 +1065,20 @@ async function handleTool(name, args) {
         recommended_rail,
         recommended_chain,
         timestamp: new Date().toISOString(),
-        doctrine: "Verana L0 — Cato settlement gate v0.2.0",
+        doctrine: "Verana L0 — Cato settlement gate v0.2.1",
         inputs: {
           ofr_stress,
           gas_gwei,
           settlement_posture: settlementContext?.settlement_posture ?? null,
         },
         chain_state: rails,
+        price_sources: {
+          eth_usd: prices.eth,
+          sol_usd: prices.sol,
+          source: prices.source,
+          timestamp: prices.timestamp,
+          fallback_used: prices.fallback_used,
+        },
         solana_note: "Solana 400ms finality eliminates T+1 window entirely at near-zero cost. Network outage history (2022-2023) requires doctrine-level resilience planning. Fallback: Base L2.",
         fed_l1_note: "Federal Reserve tokenized deposits (reserves) not yet available for on-chain settlement. PORTS (Duffie 2025) proposes sovereign instrument bridging this gap. Cato will route to Fed L1 when available. Monitor: GENIUS Act, CBDC working groups.",
       };
@@ -983,7 +1091,7 @@ async function handleTool(name, args) {
 
 // ── SERVER SETUP ─────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: "cato", version: "0.2.0" },
+  { name: "cato", version: "0.2.1" },
   { capabilities: { tools: {} } }
 );
 
@@ -1010,7 +1118,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Cato MCP Server v0.2.0 running — 22 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC. Multi-chain settlement router. Absolute doctrine for tokenized settlement governance.\n");
+  process.stderr.write("Cato MCP Server v0.2.1 running — 23 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC, CoinGecko. Multi-chain settlement router with live prices. Absolute doctrine for tokenized settlement governance.\n");
 }
 
 main().catch(err => {
