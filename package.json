@@ -1,7 +1,7 @@
 {
   "name": "cato-mcp",
-  "version": "0.1.0",
-  "description": "Absolute doctrine for tokenized settlement governance — eFICC data oracle for TradFi/DeFi convergence",
+  "version": "0.2.0",
+  "description": "Absolute doctrine for tokenized settlement governance — multi-chain eFICC settlement router for TradFi/DeFi convergence (Ethereum, Base, Arbitrum, Solana, Fed L1 pending)",
   "main": "index.js",
   "bin": { "cato-mcp": "./index.js" },
   "scripts": { "start": "node index.js" },

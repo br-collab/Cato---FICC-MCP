@@ -16,7 +16,7 @@ It feeds the **Verana L0 doctrine gate** in the Aureon governance architecture �
 
 ---
 
-## 21 Tools
+## 22 Tools
 
 ### NY Fed
 
@@ -53,15 +53,50 @@ It feeds the **Verana L0 doctrine gate** in the Aureon governance architecture �
 - `get_recent_13f_filers` — Recent institutional holdings filings
 - `get_company_filings` — Company-specific SEC filings by CIK
 
-### Tokenized Settlement (Experimental)
+### Tokenized Settlement (Multi-Chain Router — v0.2.0)
 
+- `get_multichain_gas` — Live gas/fee state across Ethereum, Base, Arbitrum, Solana, plus the `fed_l1` placeholder
 - `get_tokenized_settlement_context` — ETH gas + SOFR + OFR stress → settlement posture
-- `compare_settlement_rails` — FICC traditional vs atomic on-chain cost comparison
-- `get_atomic_settlement_gate` — Verana L0 doctrine gate: `PROCEED` / `HOLD` / `ESCALATE`
+- `compare_settlement_rails` — Ranked cost comparison across all 5 rails + recommended rail
+- `get_atomic_settlement_gate` — Verana L0 doctrine gate: `PROCEED` / `HOLD` / `ESCALATE` with `recommended_chain`
 
 ### Governance
 
-- `cato_gate` — Pre-trade DSOR context package for Aureon integration
+- `cato_gate` — Pre-trade DSOR context package for Aureon integration (now includes live multi-chain state and recommended chain)
+
+---
+
+## Supported Settlement Rails
+
+| Rail | Speed | Cost | Status |
+|------|-------|------|--------|
+| **FICC Traditional** | T+1 | ~0.5 bps clearing fee net of 40% netting benefit + SOFR cost-of-capital | Live |
+| **Ethereum L1** | ~12s | Variable gwei · current: fetched from `eth.blockscout.com` | Live |
+| **Base** (Ethereum L2) | ~2s | ~0.01 gwei · fetched from `base.blockscout.com` | Live |
+| **Arbitrum** (Ethereum L2) | ~2s | ~0.02 gwei · fetched from `arbitrum.blockscout.com` | Live |
+| **Solana** | ~400ms | ~$0.001 per settlement · `getRecentPrioritizationFees` via public RPC | Experimental |
+| **Fed L1 / PORTS** | Instant | TBD | **Pending — GENIUS Act / Duffie 2025** |
+
+> **Cato is chain-agnostic by design. The governance gate — not the rail — is the product. When the Fed issues tokenized reserves or PORTS, Cato routes there. The doctrine doesn't change. The rail does.**
+
+### Routing Doctrine (v0.2.0)
+
+```
+if OFR stress > 0.5                     → ficc_traditional   (stress overrides everything)
+else if notional > $10M and eth_gas < 30 → ethereum_l1        (large notional, gas is noise)
+else if solana_fee_usd < $0.01           → solana             (ultra-low cost for any size)
+else if base_gas < 1 gwei                → base               (L2 default when available)
+else if eth_gas > 50 gwei                → ficc_traditional   (gas spike → fall back)
+else                                     → ethereum_l1        (safe fallback)
+```
+
+### Solana notes
+
+Solana is included as an experimental settlement rail. The speed case is real — 400ms finality vs 12 seconds on Ethereum is a genuine advantage for high-frequency repo settlement. The cost case is real — sub-cent fees at any notional. The concern is also real: Solana had multiple network outages between 2022 and 2023 that would have been catastrophic for live settlement infrastructure. The doctrine answer is: **Solana as primary rail requires a proven fallback path (Base L2 or FICC) and a resilience record that warrants SR 11-7 consideration.** That's not a reason to exclude it. It's a reason to govern it properly. Which is exactly what Cato does.
+
+### Fed L1 / PORTS notes
+
+The `fed_l1` placeholder is not wishful thinking. Darrell Duffie is testifying before Congress about it. The GENIUS Act is moving through the legislative pipeline. When tokenized Fed reserves arrive, every system that didn't plan for them will scramble to retrofit. **Cato has the slot ready now.** The doctrine doesn't change when Fed L1 arrives; the rail does.
 
 ---
 
