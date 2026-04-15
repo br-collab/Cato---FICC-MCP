@@ -1,7 +1,7 @@
 {
   "name": "cato-mcp",
-  "version": "0.2.2",
-  "description": "Absolute doctrine for tokenized settlement governance — multi-chain eFICC settlement router for TradFi/DeFi convergence (Ethereum, Base, Arbitrum, Solana, Fed L1 pending). v0.2.2 restores the SOFR 1-day delta funding-shock detector validated against the September 2019 repo spike.",
+  "version": "0.2.3",
+  "description": "Absolute doctrine for tokenized settlement governance — multi-chain eFICC settlement router for TradFi/DeFi convergence (Ethereum, Base, Arbitrum, Solana, Fed L1 pending). v0.2.3 adds sticky CoinGecko price cache; v0.2.2 restored the SOFR 1-day delta funding-shock detector validated against the September 2019 repo spike.",
   "main": "index.js",
   "bin": { "cato-mcp": "./index.js" },
   "scripts": { "start": "node index.js" },

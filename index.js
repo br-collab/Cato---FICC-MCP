@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 /**
- * Cato MCP Server — v0.2.2
+ * Cato MCP Server — v0.2.3
  * Absolute doctrine for tokenized settlement governance.
  * Multi-chain settlement router with live CoinGecko price feeds.
- * v0.2.2 restores the SOFR 1-day delta check (funding-market shock
+ * v0.2.3 adds a sticky last-known-good price cache so transient
+ * CoinGecko failures no longer flip the displayed price to the
+ * static $3,500 / $150 constants — the static values are now
+ * reachable only on cold boot with CoinGecko simultaneously down.
+ * v0.2.2 restored the SOFR 1-day delta check (funding-market shock
  * detector) that was dropped in the v0.2.0 refactor — closes the
  * September 2019 repo spike gap identified by cato_backtest.py.
  *
@@ -47,13 +51,23 @@ const BLOCKSCOUT_CHAINS = {
 const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 
 // Price fallback values — used only when the CoinGecko public API is
-// unreachable. v0.2.1 replaces the v0.2.0 static proxies with live
-// CoinGecko prices via getLivePrices() below. The fallback constants
-// are retained so Cato still produces a meaningful cost estimate when
-// CoinGecko is rate-limited or offline, and so the fallback path is
-// observable in the output (price_sources.fallback_used = true).
-const ETH_PRICE_FALLBACK = 3500;   // USD per ETH — CoinGecko fallback
-const SOL_PRICE_FALLBACK = 150;    // USD per SOL — CoinGecko fallback
+// unreachable AND we have no sticky last-known-good value. v0.2.1
+// replaced the v0.2.0 static proxies with live CoinGecko prices via
+// getLivePrices() below; v0.2.3 adds sticky cache so transient
+// CoinGecko failures don't flip the displayed price to the static
+// constant (the Jonathan-on-a-trading-desk-review failure mode).
+const ETH_PRICE_FALLBACK = 3500;   // USD per ETH — CoinGecko cold-boot fallback
+const SOL_PRICE_FALLBACK = 150;    // USD per SOL — CoinGecko cold-boot fallback
+
+// v0.2.3 sticky last-known-good price cache. Updated on every
+// successful getLivePrices() call. Read on failure so transient
+// CoinGecko hiccups (rate limit, network blip) degrade to a
+// slightly-stale realistic value instead of flipping to $3,500.
+let _lastLivePrices = {
+  eth: null,     // USD per ETH
+  sol: null,     // USD per SOL
+  ts: 0,         // Date.now() of last successful fetch
+};
 
 // Doctrine thresholds — mirror aureon/mcp/cato_client.py exactly. The
 // parity principle (hard rule) says these must be identical across the
@@ -79,7 +93,7 @@ const FRED_KEY = process.env.FRED_API_KEY || ""; // Free key from fred.stlouisfe
 async function get(url, params = {}) {
   try {
     const res = await axios.get(url, { params, timeout: 10000,
-      headers: { "User-Agent": "Cato-MCP-Server/0.2.2 (open-source; Project Aureon; contact: github)" }
+      headers: { "User-Agent": "Cato-MCP-Server/0.2.3 (open-source; Project Aureon; contact: github)" }
     });
     return res.data;
   } catch (e) {
@@ -87,12 +101,24 @@ async function get(url, params = {}) {
   }
 }
 
-// ── CoinGecko live prices (v0.2.1) ───────────────────────────────────────────
+// ── CoinGecko live prices (v0.2.3 sticky cache) ──────────────────────────────
 // Fetches live ETH and SOL USD prices from the free CoinGecko public API.
-// No auth required. Returns {eth, sol, source, timestamp, fallback_used}.
-// If CoinGecko is unreachable or rate-limited, returns the static fallback
-// constants with fallback_used=true so the caller can surface the degraded
-// state. Doctrine note: for institutional deployment, replace with a
+// No auth required. Three possible result states:
+//
+//   1. coingecko_public  — fresh fetch succeeded; updates _lastLivePrices
+//                          for future sticky reads and returns the live
+//                          values with fallback_used=false.
+//   2. coingecko_stale   — fresh fetch failed but _lastLivePrices has a
+//                          prior successful value. Returns that value so
+//                          the displayed price stays realistic instead of
+//                          flipping to $3,500. Marked fallback_used=true
+//                          so dashboard/LLM callers see the degraded state.
+//   3. static_fallback   — cold boot and CoinGecko is unreachable. Only
+//                          path to the hardcoded constants. Should be
+//                          rare after the first successful fetch of the
+//                          server's lifetime.
+//
+// Doctrine note: for institutional deployment, replace CoinGecko with a
 // licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).
 async function getLivePrices() {
   try {
@@ -102,16 +128,37 @@ async function getLivePrices() {
     );
     const ethUsd = res?.ethereum?.usd;
     const solUsd = res?.solana?.usd;
-    const fallbackUsed = !ethUsd || !solUsd;
-    return {
-      eth: ethUsd || ETH_PRICE_FALLBACK,
-      sol: solUsd || SOL_PRICE_FALLBACK,
-      source: fallbackUsed ? "coingecko_partial_fallback" : "coingecko_public",
-      timestamp: new Date().toISOString(),
-      fallback_used: fallbackUsed,
-      note: "Live prices via CoinGecko public API. For institutional deployment use a licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).",
-    };
+    if (ethUsd && solUsd) {
+      // Sticky cache update — remember for future transient failures.
+      _lastLivePrices.eth = ethUsd;
+      _lastLivePrices.sol = solUsd;
+      _lastLivePrices.ts = Date.now();
+      return {
+        eth: ethUsd,
+        sol: solUsd,
+        source: "coingecko_public",
+        timestamp: new Date().toISOString(),
+        fallback_used: false,
+        note: "Live prices via CoinGecko public API. For institutional deployment use a licensed price feed (Bloomberg BVAL, Refinitiv, Chainlink Price Feeds).",
+      };
+    }
+    throw new Error("CoinGecko response missing ethereum or solana field");
   } catch (e) {
+    // Failure path — prefer sticky last-known-good over static constants.
+    if (_lastLivePrices.eth !== null && _lastLivePrices.sol !== null) {
+      const stale_age_seconds = Math.round((Date.now() - _lastLivePrices.ts) / 1000);
+      return {
+        eth: _lastLivePrices.eth,
+        sol: _lastLivePrices.sol,
+        source: "coingecko_stale",
+        timestamp: new Date().toISOString(),
+        fallback_used: true,
+        stale_age_seconds,
+        error: e.message,
+        note: `Last-known-good CoinGecko price from ${stale_age_seconds}s ago. Next refresh cycle will retry.`,
+      };
+    }
+    // Cold boot + CoinGecko unreachable — only path to the static constants.
     return {
       eth: ETH_PRICE_FALLBACK,
       sol: SOL_PRICE_FALLBACK,
@@ -119,7 +166,7 @@ async function getLivePrices() {
       timestamp: new Date().toISOString(),
       fallback_used: true,
       error: e.message,
-      note: "CoinGecko unreachable. Using Cato static fallback prices.",
+      note: "CoinGecko unreachable and no sticky cache (cold boot). Using Cato static fallback prices.",
     };
   }
 }
@@ -1143,7 +1190,7 @@ async function handleTool(name, args) {
 
 // ── SERVER SETUP ─────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: "cato", version: "0.2.2" },
+  { name: "cato", version: "0.2.3" },
   { capabilities: { tools: {} } }
 );
 
@@ -1170,7 +1217,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("Cato MCP Server v0.2.2 running — 23 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC, CoinGecko. Multi-chain settlement router with live prices + SOFR delta funding-shock detector. Absolute doctrine for tokenized settlement governance.\n");
+  process.stderr.write("Cato MCP Server v0.2.3 running — 23 tools across NY Fed, FRED, TreasuryDirect, OFR, SEC EDGAR, Blockscout (ETH/Base/Arbitrum), Solana RPC, CoinGecko. Multi-chain settlement router with live prices (sticky cache) + SOFR delta funding-shock detector. Absolute doctrine for tokenized settlement governance.\n");
 }
 
 main().catch(err => {
