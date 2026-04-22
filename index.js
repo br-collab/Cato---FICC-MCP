@@ -1155,12 +1155,18 @@ async function handleTool(name, args) {
         recommended_rail,
         recommended_chain,
         timestamp: new Date().toISOString(),
-        doctrine: "Verana L0 — Cato settlement gate v0.2.2",
+        // Phase 2 P2-4 (Aureon-side fix 2026-04-22): doctrine version
+        // and input field names aligned with the in-process Python twin
+        // at aureon/mcp/cato_client.py in br-collab/aureon. Prior labels
+        // (v0.2.2 + sofr_today_pct/sofr_prev_pct) produced bit-for-bit
+        // identical DECISIONS for identical inputs but diverged in the
+        // emitted schema, violating Grid 3 CLAUDE.md's parity rule.
+        doctrine: "Verana L0 — Cato settlement gate v0.2.3",
         inputs: {
           ofr_stress,
           gas_gwei,
-          sofr_today_pct: sofrToday,
-          sofr_prev_pct: sofrPrev,
+          sofr_rate: sofrToday,
+          sofr_prev: sofrPrev,
           sofr_delta_bps: sofrDeltaBps !== null ? +sofrDeltaBps.toFixed(2) : null,
           settlement_posture: settlementContext?.settlement_posture ?? null,
         },
